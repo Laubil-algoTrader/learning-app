@@ -1,4 +1,4 @@
-const CACHE_NAME = "aprendelab-v27";
+const CACHE_NAME = "aprendelab-v31";
 const STATIC_ASSETS = [
   "/",
   "/index.html",
@@ -6,6 +6,10 @@ const STATIC_ASSETS = [
   "/icon.svg",
   "/css/styles.css",
   "/js/icons.js",
+  "/js/art.js",
+  "/js/math_render.js",
+  "/js/tools_drawer.js",
+  "/js/diagrams.js",
   "/js/main.js",
   "/js/views/dashboard.js",
   "/js/views/library.js",
@@ -17,6 +21,8 @@ const STATIC_ASSETS = [
   "/js/views/creator.js",
   "/js/views/exercises.js",
   "/js/views/ingreso.js",
+  "/js/views/study_hub.js",
+  "/js/views/diagnostic.js",
   "/js/labs/guitar_lab.js",
   "/js/labs/electronics_lab.js",
   "/js/labs/math_lab.js",

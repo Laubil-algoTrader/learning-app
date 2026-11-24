@@ -114,10 +114,10 @@ def make_handler(db: Database, frontend_dir: Path = FRONTEND_DIR, pin: str | Non
             self.end_headers()
             self.wfile.write(raw)
 
-        def _read_body(self) -> bytes:
+        def _read_body(self, max_bytes: int = 5 * 1024 * 1024) -> bytes:
             length = int(self.headers.get("Content-Length", "0") or "0")
-            if length > 5 * 1024 * 1024:
-                raise APIError(413, "Payload demasiado grande (máx 5MB).")
+            if length > max_bytes:
+                raise APIError(413, f"Payload demasiado grande (máx {max_bytes // (1024 * 1024)}MB).")
             return self.rfile.read(length) if length > 0 else b""
 
         def _serve_static(self, raw_path: str) -> None:
@@ -150,12 +150,32 @@ def make_handler(db: Database, frontend_dir: Path = FRONTEND_DIR, pin: str | Non
         def _dispatch(self, method: str) -> None:
             if self.path.startswith("/api/"):
                 try:
-                    body = self._read_body()
-                    if urlparse(self.path).path.rstrip("/") == "/api/auth" and method == "POST":
+                    clean_path = urlparse(self.path).path.rstrip("/")
+                    max_size = 25 * 1024 * 1024 if clean_path == "/api/backup/restore-db" else 5 * 1024 * 1024
+                    body = self._read_body(max_bytes=max_size)
+                    if clean_path == "/api/auth" and method == "POST":
                         self._handle_auth(body)
                         return
                     if not self._authorized():
                         self._send_json(401, {"error": "Ingresá el PIN.", "pin_required": True})
+                        return
+                    if clean_path == "/api/backup/db" and method == "GET":
+                        raw_db = Path(db.db_path).read_bytes()
+                        fname = f"aprendelab-backup-{time.strftime('%Y-%m-%d')}.db"
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-sqlite3")
+                        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                        self.send_header("Content-Length", str(len(raw_db)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(raw_db)
+                        return
+                    if clean_path == "/api/backup/restore-db" and method == "POST":
+                        try:
+                            result = db.restore_sqlite_file(body)
+                        except ValueError as exc:
+                            raise APIError(400, str(exc)) from exc
+                        self._send_json(200, {"restored": result})
                         return
                     status, data = handle_api_request(db, method, self.path, body)
                     self._send_json(status, data)
@@ -195,6 +215,10 @@ def create_server(
     keyfile: str | Path | None = None,
 ) -> ThreadingHTTPServer:
     db = Database(db_path)
+    try:
+        db.create_auto_backup()
+    except Exception:
+        pass
     handler = make_handler(db, FRONTEND_DIR, pin=pin)
     server = ThreadingHTTPServer((host, port), handler)
     if certfile and keyfile:

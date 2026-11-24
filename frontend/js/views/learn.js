@@ -1,5 +1,6 @@
 import { icon } from "../icons.js";
 import { api, esc, rich, labLinkToHash, registerCleanup, toast, toneOf } from "../main.js";
+import { lessonDiagram } from "../diagrams.js";
 import { renderChordSVG } from "../labs/guitar_lab.js";
 
 const STEPS = [
@@ -46,7 +47,8 @@ export async function renderLearn(container, nodeId) {
 
   let stepIdx = 0;
   let checkIdx = 0;
-  let takeawayText = "";
+  let takeawayText = data.note?.content || "";
+  let bookmarked = Boolean(data.note?.bookmarked);
   let completedNow = Boolean(node.lesson_completed);
   let createdCards = 0;
 
@@ -131,6 +133,7 @@ export async function renderLearn(container, nodeId) {
                 </div>`
               : ""
           }
+          ${lessonDiagram(node.slug)}
           <div class="card-tone stack-sm" style="padding:20px 24px;">
             <span class="eyebrow m-0">Para acordarte</span>
             <p class="title-sm m-0 rich">${rich(lesson.concept.key_rule)}</p>
@@ -207,7 +210,11 @@ export async function renderLearn(container, nodeId) {
         ${
           !completedNow
             ? `<div><button id="complete-lesson-btn" class="btn btn-primary btn-lg" type="button">${icon("check", 18)} Terminar la lección</button></div>`
-            : `<div class="card-tone stack">
+            : `<div class="row">
+                 <button id="save-note-btn" class="btn btn-secondary btn-sm" type="button">${icon("check", 14)} Guardar apunte en el cuaderno</button>
+                 <a href="#/cuaderno" class="btn btn-text btn-sm">Abrir cuaderno</a>
+               </div>
+               <div class="card-tone stack">
                 <div>
                   <h3 class="m-0">Lección terminada</h3>
                   <p class="m-0 muted">${
@@ -251,6 +258,9 @@ export async function renderLearn(container, nodeId) {
             </div>
             <h1 class="title-md" style="font-size:clamp(2rem,4.2vw,3.25rem);">${esc(title)}</h1>
           </div>
+          <button type="button" id="lesson-bookmark" class="btn btn-sm ${bookmarked ? "btn-primary" : "btn-secondary"}" aria-pressed="${bookmarked}" title="Marcar este tema para repasar antes del parcial">
+            ${bookmarked ? "★ Para el parcial" : "☆ Marcar tema"}
+          </button>
         </div>
 
         <div class="lesson-stepper" role="tablist" aria-label="Pasos de la lección">
@@ -266,7 +276,7 @@ export async function renderLearn(container, nodeId) {
         <div class="card" style="padding:clamp(24px,4vw,44px);">${stepHtml()}</div>
 
         <div class="row-between mt-lg">
-          <div>
+          <div class="row gap-sm">
             ${
               stepIdx > 0
                 ? `<button id="prev-step" class="btn btn-secondary" type="button">${icon("arrowLeft", 16)} Anterior</button>`
@@ -274,6 +284,7 @@ export async function renderLearn(container, nodeId) {
                 ? `<a href="#/learn/${prev_node.id}" class="btn btn-secondary">${icon("arrowLeft", 16)} Lección anterior</a>`
                 : ""
             }
+            <button id="lesson-report-btn" class="btn btn-text btn-sm muted" type="button" title="Reportar un error en esta lección">${icon("alert", 13)} Reportar error</button>
           </div>
           ${
             stepIdx < STEPS.length - 1
@@ -320,6 +331,37 @@ export async function renderLearn(container, nodeId) {
         container.querySelector(c.solved ? "#next-step" : ".check-opt:not(.wrong)")?.focus({ preventScroll: true });
       })
     );
+    container.querySelector("#lesson-report-btn")?.addEventListener("click", async () => {
+      const msg = window.prompt(`¿Qué error o detalle encontraste en «${title}»?`);
+      if (!msg || !msg.trim()) return;
+      try {
+        await api.post("/api/reports", { kind: "lesson", target_id: String(node.id), title, message: msg.trim() });
+        toast("Reporte guardado (visible en Ajustes)", "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+    container.querySelector("#lesson-bookmark")?.addEventListener("click", async () => {
+      const next = !bookmarked;
+      try {
+        await api.put(`/api/notes/${node.id}`, { bookmarked: next });
+        bookmarked = next;
+        toast(next ? "Marcado para repasar antes del parcial" : "Marca quitada", "ok");
+        paint();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+    container.querySelector("#save-note-btn")?.addEventListener("click", async () => {
+      const area = container.querySelector("#lesson-feynman");
+      takeawayText = area ? area.value : takeawayText;
+      try {
+        await api.put(`/api/notes/${node.id}`, { content: takeawayText });
+        toast("Apunte guardado en tu cuaderno", "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
     container.querySelector("#complete-lesson-btn")?.addEventListener("click", async () => {
       const area = container.querySelector("#lesson-feynman");
       takeawayText = area ? area.value : takeawayText;

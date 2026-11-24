@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS learning_items (
     lapses INTEGER NOT NULL DEFAULT 0,
     due_at TEXT,
     last_review_at TEXT,
+    suspended INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS review_logs (
     elapsed_days REAL NOT NULL DEFAULT 0.0,
     duration_sec INTEGER NOT NULL DEFAULT 0,
     feynman_note TEXT NOT NULL DEFAULT '',
+    prev_state_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 
@@ -148,6 +150,57 @@ CREATE TABLE IF NOT EXISTS exercise_attempts (
     parts_ok INTEGER NOT NULL DEFAULT 0,
     parts_total INTEGER NOT NULL DEFAULT 0,
     saw_solution INTEGER NOT NULL DEFAULT 0,
+    error_tag TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS exam_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_slug TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'general',
+    title TEXT NOT NULL DEFAULT '',
+    units_json TEXT NOT NULL DEFAULT '[]',
+    score_pct INTEGER NOT NULL,
+    procedure_score_pct INTEGER,
+    passed INTEGER NOT NULL DEFAULT 0,
+    correct_count INTEGER NOT NULL,
+    total_count INTEGER NOT NULL,
+    duration_sec INTEGER NOT NULL DEFAULT 0,
+    time_limit_sec INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS study_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL UNIQUE REFERENCES nodes(id) ON DELETE CASCADE,
+    domain_slug TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    bookmarked INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS content_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custom_exercises (
+    id TEXT PRIMARY KEY,
+    domain_slug TEXT NOT NULL,
+    node_slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    level INTEGER NOT NULL DEFAULT 1,
+    minutes INTEGER NOT NULL DEFAULT 5,
+    statement TEXT NOT NULL,
+    parts_json TEXT NOT NULL DEFAULT '[]',
+    hints_json TEXT NOT NULL DEFAULT '[]',
+    solution_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 
@@ -156,6 +209,9 @@ CREATE INDEX IF NOT EXISTS idx_items_node ON learning_items(node_id);
 CREATE INDEX IF NOT EXISTS idx_logs_created ON review_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_metrics_domain ON practice_metrics(domain_id, metric_type);
 CREATE INDEX IF NOT EXISTS idx_attempts_exercise ON exercise_attempts(exercise_id);
+CREATE INDEX IF NOT EXISTS idx_exams_domain ON exam_attempts(domain_slug, created_at);
+CREATE INDEX IF NOT EXISTS idx_notes_domain ON study_notes(domain_slug);
+CREATE INDEX IF NOT EXISTS idx_custom_ex_node ON custom_exercises(node_slug);
 """
 
 
@@ -250,6 +306,19 @@ class Database:
                 """
             )
             self._set_raw_setting(conn, "schema_version", str(SCHEMA_VERSION))
+        # Safe additive columns on existing databases
+        attempt_cols = {r[1] for r in conn.execute("PRAGMA table_info(exercise_attempts)").fetchall()}
+        if "error_tag" not in attempt_cols:
+            conn.execute("ALTER TABLE exercise_attempts ADD COLUMN error_tag TEXT NOT NULL DEFAULT ''")
+        item_cols = {r[1] for r in conn.execute("PRAGMA table_info(learning_items)").fetchall()}
+        if "suspended" not in item_cols:
+            conn.execute("ALTER TABLE learning_items ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0")
+        log_cols = {r[1] for r in conn.execute("PRAGMA table_info(review_logs)").fetchall()}
+        if "prev_state_json" not in log_cols:
+            conn.execute("ALTER TABLE review_logs ADD COLUMN prev_state_json TEXT NOT NULL DEFAULT '{}'")
+        exam_cols = {r[1] for r in conn.execute("PRAGMA table_info(exam_attempts)").fetchall()}
+        if "procedure_score_pct" not in exam_cols:
+            conn.execute("ALTER TABLE exam_attempts ADD COLUMN procedure_score_pct INTEGER")
 
     def _sync_seed_content(self, conn: sqlite3.Connection) -> None:
         """Add new built-in nodes, cards and auto-check payloads once per content version.
@@ -476,11 +545,19 @@ class Database:
             ui_state = json.loads(raw.get("ui_state") or "{}")
         except json.JSONDecodeError:
             ui_state = {}
+        try:
+            exam_dates = json.loads(raw.get("exam_dates") or "{}")
+        except json.JSONDecodeError:
+            exam_dates = {}
         return {
             "desired_retention": float(raw.get("desired_retention", 0.90)),
             "default_session_minutes": int(raw.get("default_session_minutes", 25)),
             "theme": raw.get("theme", "light"),
             "new_per_day": int(raw.get("new_per_day", 8)),
+            "daily_lesson_goal": int(raw.get("daily_lesson_goal", 1)),
+            "daily_exercise_goal": int(raw.get("daily_exercise_goal", 4)),
+            "ingreso_focus_mode": raw.get("ingreso_focus_mode", "false") == "true",
+            "exam_dates": exam_dates if isinstance(exam_dates, dict) else {},
             "ui_state": ui_state if isinstance(ui_state, dict) else {},
         }
 
@@ -506,6 +583,26 @@ class Database:
             if "new_per_day" in updates:
                 per_day = int(fsrs.clamp(float(updates["new_per_day"]), 0, 40))
                 self._set_raw_setting(conn, "new_per_day", str(per_day))
+            if "daily_lesson_goal" in updates:
+                val = int(fsrs.clamp(float(updates["daily_lesson_goal"]), 1, 10))
+                self._set_raw_setting(conn, "daily_lesson_goal", str(val))
+            if "daily_exercise_goal" in updates:
+                val = int(fsrs.clamp(float(updates["daily_exercise_goal"]), 1, 30))
+                self._set_raw_setting(conn, "daily_exercise_goal", str(val))
+            if "ingreso_focus_mode" in updates:
+                self._set_raw_setting(conn, "ingreso_focus_mode", "true" if updates["ingreso_focus_mode"] else "false")
+            if isinstance(updates.get("exam_dates"), dict):
+                try:
+                    merged_dates = json.loads(self._get_raw_setting(conn, "exam_dates", "{}") or "{}")
+                except json.JSONDecodeError:
+                    merged_dates = {}
+                for k, v in updates["exam_dates"].items():
+                    s_val = str(v or "").strip()
+                    if not s_val:
+                        merged_dates.pop(str(k), None)
+                    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", s_val):
+                        merged_dates[str(k)] = s_val
+                self._set_raw_setting(conn, "exam_dates", json.dumps(merged_dates, ensure_ascii=False))
             if isinstance(updates.get("ui_state"), dict):
                 # Shallow-merge small UI state blobs (e.g. project checklists) so they sync across devices
                 try:
@@ -597,6 +694,7 @@ class Database:
             "lapses": row["lapses"],
             "due_at": row["due_at"],
             "last_review_at": row["last_review_at"],
+            "suspended": bool(row["suspended"]) if "suspended" in row.keys() else False,
             "retrievability": retr,
             "is_due": is_due,
             "due_label": self._due_label(row["state"], due_dt, now),
@@ -638,6 +736,8 @@ class Database:
                 mastered_items = 0
                 progress_sum = 0.0
                 for it in items:
+                    if it["suspended"]:
+                        continue
                     card = self._row_to_card(it)
                     due_dt = fsrs.parse_iso(it["due_at"])
                     if it["state"] == "new":
@@ -805,7 +905,7 @@ class Database:
                 "mastery_pct": mastery_pct,
                 "practiced_pct": practiced_pct,
                 "has_lesson": has_lesson,
-                "due_count": sum(1 for it in n_items if it["state"] != "new" and it["is_due"]),
+                "due_count": sum(1 for it in n_items if it["state"] != "new" and it["is_due"] and not it.get("suspended")),
                 "total_reps": total_reps,
                 "total_lapses": total_lapses,
                 "started": started,
@@ -999,6 +1099,16 @@ class Database:
                 """,
                 (row["domain_id"], node_id, row["title"], feynman_note, now_iso),
             )
+            if feynman_note:
+                dom = conn.execute("SELECT slug FROM domains WHERE id = ?", (row["domain_id"],)).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO study_notes(node_id, domain_slug, content, bookmarked, updated_at)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at
+                    """,
+                    (node_id, dom["slug"] if dom else "", feynman_note, now_iso),
+                )
             # Each comprehension question the learner missed becomes a spaced-repetition card
             created_cards = 0
             for miss in (payload.get("missed_checks") or [])[:6]:
@@ -1090,6 +1200,54 @@ class Database:
             "prerequisites": json.loads(row["prerequisites_json"] or "[]"),
         }
 
+    def update_node(self, node_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+            if not row:
+                raise KeyError("Nodo no encontrado.")
+            title = (payload.get("title", row["title"]) or "").strip()
+            if not title:
+                raise ValueError("El título del nodo es obligatorio.")
+            summary = (payload.get("summary", row["summary"]) or "").strip()
+            level = max(1, min(20, int(payload.get("level", row["level"]) or 1)))
+            prereqs_json = (
+                json.dumps(payload["prerequisites"], ensure_ascii=False)
+                if "prerequisites" in payload
+                else row["prerequisites_json"]
+            )
+            lesson_json = row["lesson_json"]
+            if isinstance(payload.get("lesson"), dict):
+                lesson_json = json.dumps(payload["lesson"], ensure_ascii=False)
+            conn.execute(
+                """
+                UPDATE nodes
+                SET title = ?, summary = ?, level = ?, prerequisites_json = ?, lesson_json = ?
+                WHERE id = ?
+                """,
+                (title, summary, level, prereqs_json, lesson_json, node_id),
+            )
+            updated = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        return {
+            "id": updated["id"],
+            "domain_id": updated["domain_id"],
+            "slug": updated["slug"],
+            "title": updated["title"],
+            "level": updated["level"],
+            "order_index": updated["order_index"],
+            "summary": updated["summary"],
+            "prerequisites": json.loads(updated["prerequisites_json"] or "[]"),
+            "lesson": json.loads(updated["lesson_json"] or "{}"),
+        }
+
+    def delete_node(self, node_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT slug FROM nodes WHERE id = ?", (node_id,)).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM custom_exercises WHERE node_slug = ?", (row["slug"],))
+            cur = conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            return cur.rowcount > 0
+
     def create_item(self, payload: dict[str, Any]) -> dict[str, Any]:
         node_id = int(payload["node_id"])
         title = (payload.get("title") or "").strip()
@@ -1154,18 +1312,41 @@ class Database:
                     else:
                         merged[k] = v
                 payload_json = json.dumps(merged, ensure_ascii=False)
+            suspended = (
+                (1 if payload["suspended"] else 0)
+                if "suspended" in payload
+                else int(row["suspended"] or 0)
+            )
             conn.execute(
                 """
                 UPDATE learning_items
-                SET title = ?, prompt = ?, answer = ?, item_type = ?, hints_json = ?, payload_json = ?
+                SET title = ?, prompt = ?, answer = ?, item_type = ?, hints_json = ?, payload_json = ?, suspended = ?
                 WHERE id = ?
                 """,
-                (title, prompt, answer, item_type, hints_json, payload_json, item_id),
+                (title, prompt, answer, item_type, hints_json, payload_json, suspended, item_id),
             )
             updated = conn.execute(
                 "SELECT * FROM learning_items WHERE id = ?", (item_id,)
             ).fetchone()
         return self._serialize_item(updated, now, self.get_settings()["desired_retention"], True)
+
+    def list_suspended_items(self) -> list[dict[str, Any]]:
+        now = fsrs.utc_now()
+        ret = self.get_settings()["desired_retention"]
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT li.*, d.name AS domain_name, d.slug AS domain_slug,
+                       d.icon AS domain_icon, d.color AS domain_color,
+                       n.title AS node_title, n.slug AS node_slug
+                FROM learning_items li
+                JOIN domains d ON d.id = li.domain_id
+                JOIN nodes n ON n.id = li.node_id
+                WHERE COALESCE(li.suspended, 0) = 1
+                ORDER BY li.id DESC
+                """
+            ).fetchall()
+        return [self._serialize_item(r, now, ret, False) for r in rows]
 
     def delete_item(self, item_id: int) -> bool:
         with self.connect() as conn:
@@ -1218,7 +1399,7 @@ class Database:
             FROM learning_items li
             JOIN domains d ON d.id = li.domain_id
             JOIN nodes n ON n.id = li.node_id
-            WHERE 1=1
+            WHERE COALESCE(li.suspended, 0) = 0
         """
         params: list[Any] = []
         if domain_slug:
@@ -1304,6 +1485,15 @@ class Database:
             if not row:
                 raise KeyError("Ítem no encontrado.")
             card = self._row_to_card(row)
+            prev_snapshot = {
+                "state": row["state"],
+                "stability": float(row["stability"] or 0.0),
+                "difficulty": float(row["difficulty"] or 0.0),
+                "reps": int(row["reps"] or 0),
+                "lapses": int(row["lapses"] or 0),
+                "due_at": row["due_at"],
+                "last_review_at": row["last_review_at"],
+            }
             sched = fsrs.schedule_review(
                 card, rating, now=now, desired_retention=settings["desired_retention"]
             )
@@ -1325,12 +1515,12 @@ class Database:
                     item_id,
                 ),
             )
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO review_logs(
                     item_id, domain_id, node_id, rating, confidence_before,
-                    elapsed_days, duration_sec, feynman_note, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    elapsed_days, duration_sec, feynman_note, prev_state_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
@@ -1341,16 +1531,104 @@ class Database:
                     sched["elapsed_days"],
                     max(0, int(payload.get("duration_sec") or 0)),
                     (payload.get("feynman_note") or "").strip(),
+                    json.dumps(prev_snapshot, ensure_ascii=False),
                     fsrs.to_iso(now),
                 ),
             )
+            log_id = cur.lastrowid
             updated = conn.execute(
                 "SELECT * FROM learning_items WHERE id = ?", (item_id,)
             ).fetchone()
         return {
+            "review_log_id": log_id,
             "item": self._serialize_item(updated, now, settings["desired_retention"], True),
             "schedule": sched,
         }
+
+    def undo_last_review(self, log_id: int | None = None) -> dict[str, Any]:
+        """Undo a review (the given log_id or the most recent one) restoring prior FSRS state."""
+        now = fsrs.utc_now()
+        settings = self.get_settings()
+        with self.connect() as conn:
+            if log_id is not None:
+                log = conn.execute("SELECT * FROM review_logs WHERE id = ?", (int(log_id),)).fetchone()
+            else:
+                log = conn.execute("SELECT * FROM review_logs ORDER BY id DESC LIMIT 1").fetchone()
+            if not log:
+                raise KeyError("No hay ningún repaso reciente para deshacer.")
+            prev = json.loads(log["prev_state_json"] or "{}")
+            if not prev:
+                raise ValueError("Este repaso no tiene estado previo guardado para deshacer.")
+            conn.execute(
+                """
+                UPDATE learning_items
+                SET state = ?, stability = ?, difficulty = ?, reps = ?, lapses = ?,
+                    due_at = ?, last_review_at = ?
+                WHERE id = ?
+                """,
+                (
+                    prev.get("state", "new"),
+                    float(prev.get("stability") or 0.0),
+                    float(prev.get("difficulty") or 0.0),
+                    int(prev.get("reps") or 0),
+                    int(prev.get("lapses") or 0),
+                    prev.get("due_at"),
+                    prev.get("last_review_at"),
+                    log["item_id"],
+                ),
+            )
+            conn.execute("DELETE FROM review_logs WHERE id = ?", (log["id"],))
+            restored = conn.execute(
+                """
+                SELECT li.*, d.name AS domain_name, d.slug AS domain_slug,
+                       d.icon AS domain_icon, d.color AS domain_color,
+                       n.title AS node_title, n.slug AS node_slug
+                FROM learning_items li
+                JOIN domains d ON d.id = li.domain_id
+                JOIN nodes n ON n.id = li.node_id
+                WHERE li.id = ?
+                """,
+                (log["item_id"],),
+            ).fetchone()
+        return {
+            "undone_log_id": log["id"],
+            "item": self._serialize_item(restored, now, settings["desired_retention"], True) if restored else None,
+        }
+
+    # ---------- Content error reports ----------
+
+    def create_report(self, payload: dict[str, Any]) -> dict[str, Any]:
+        kind = str(payload.get("kind") or "other").strip()[:32]
+        target_id = str(payload.get("target_id") or "").strip()[:120]
+        title = str(payload.get("title") or "").strip()[:160]
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            raise ValueError("Describí brevemente el error encontrado.")
+        now_iso = fsrs.to_iso(fsrs.utc_now())
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO content_reports(kind, target_id, title, message, status, created_at)
+                VALUES (?, ?, ?, ?, 'open', ?)
+                """,
+                (kind, target_id, title, message, now_iso),
+            )
+            row = conn.execute("SELECT * FROM content_reports WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+    def list_reports(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM content_reports ORDER BY created_at DESC, id DESC LIMIT 100"
+                ).fetchall()
+            ]
+
+    def delete_report(self, report_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM content_reports WHERE id = ?", (int(report_id),))
+            return cur.rowcount > 0
 
     # ---------- Smart Interleaved Session Generator ----------
 
@@ -1378,11 +1656,12 @@ class Database:
                 FROM learning_items li
                 JOIN domains d ON d.id = li.domain_id
                 JOIN nodes n ON n.id = li.node_id
+                WHERE COALESCE(li.suspended, 0) = 0
             """
             params: list[Any] = []
             if domain_slugs:
                 placeholders = ",".join("?" for _ in domain_slugs)
-                query += f" WHERE d.slug IN ({placeholders})"
+                query += f" AND d.slug IN ({placeholders})"
                 params.extend(domain_slugs)
             rows = conn.execute(query, params).fetchall()
             learnable = self._learnable_node_ids(conn)
@@ -1607,7 +1886,7 @@ class Database:
             ).fetchone()[0]
             total_reviews = conn.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0]
             due_rows = conn.execute(
-                "SELECT state, due_at FROM learning_items WHERE state != 'new' AND due_at IS NOT NULL"
+                "SELECT state, due_at FROM learning_items WHERE state != 'new' AND due_at IS NOT NULL AND COALESCE(suspended, 0) = 0"
             ).fetchall()
             recent_metrics = [
                 dict(r)
@@ -1794,7 +2073,103 @@ class Database:
             "settings": self.get_settings(),
         }
 
-    # ---------- Export / Import JSON ----------
+    # ---------- Export / Import JSON & Automatic / SQLite Backups ----------
+
+    def create_auto_backup(self, max_keep: int = 7) -> Path | None:
+        """Create a safe online SQLite daily backup under <db_dir>/backups/ and rotate old ones."""
+        if not self.db_path.exists():
+            return None
+        backup_dir = self.db_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        day_tag = datetime.now().strftime("%Y-%m-%d")
+        dest = backup_dir / f"aprendelab-{day_tag}.db"
+        if not dest.exists():
+            tmp = backup_dir / f".tmp-{day_tag}.db"
+            src_conn = sqlite3.connect(self.db_path)
+            dst_conn = sqlite3.connect(tmp)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+                src_conn.close()
+            tmp.replace(dest)
+        # Rotate keeping the newest `max_keep` daily snapshots
+        snapshots = sorted(backup_dir.glob("aprendelab-*.db"), reverse=True)
+        for old in snapshots[max_keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return dest
+
+    def list_auto_backups(self) -> list[dict[str, Any]]:
+        backup_dir = self.db_path.parent / "backups"
+        if not backup_dir.exists():
+            return []
+        out = []
+        for p in sorted(backup_dir.glob("*.db"), reverse=True)[:14]:
+            st = p.stat()
+            out.append(
+                {
+                    "name": p.name,
+                    "size_kb": max(1, round(st.st_size / 1024)),
+                    "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                }
+            )
+        return out
+
+    def restore_sqlite_file(self, raw_bytes: bytes) -> dict[str, Any]:
+        """Validate an uploaded SQLite .db file, snapshot the current DB, and replace it atomically."""
+        if not raw_bytes or not raw_bytes.startswith(b"SQLite format 3\x00"):
+            raise ValueError("El archivo no es una base de datos SQLite válida (.db).")
+        backup_dir = self.db_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        tmp = backup_dir / f".upload-{int(datetime.now().timestamp())}.db"
+        tmp.write_bytes(raw_bytes)
+        try:
+            check_conn = sqlite3.connect(tmp)
+            try:
+                integrity = check_conn.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise ValueError("El archivo SQLite está dañado (falló integrity_check).")
+                tables = {
+                    r[0]
+                    for r in check_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                required = {"domains", "nodes", "learning_items", "review_logs"}
+                if not required.issubset(tables):
+                    raise ValueError("El archivo SQLite no parece ser un respaldo de AprendeLab.")
+                counts = {
+                    "domains": check_conn.execute("SELECT COUNT(*) FROM domains").fetchone()[0],
+                    "nodes": check_conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0],
+                    "reviews": check_conn.execute("SELECT COUNT(*) FROM review_logs").fetchone()[0],
+                }
+            finally:
+                check_conn.close()
+
+            # Save a pre-restore safety snapshot of the current database
+            if self.db_path.exists():
+                safety = backup_dir / f"pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
+                s_src = sqlite3.connect(self.db_path)
+                s_dst = sqlite3.connect(safety)
+                try:
+                    s_src.backup(s_dst)
+                finally:
+                    s_dst.close()
+                    s_src.close()
+
+            tmp.replace(self.db_path)
+            self.init_db()
+            return {"ok": True, **counts}
+        except Exception:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            raise
 
     def export_json(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -1802,15 +2177,323 @@ class Database:
             nodes = [dict(r) for r in conn.execute("SELECT * FROM nodes ORDER BY id").fetchall()]
             items = [dict(r) for r in conn.execute("SELECT * FROM learning_items ORDER BY id").fetchall()]
             metrics = [dict(r) for r in conn.execute("SELECT * FROM practice_metrics ORDER BY id").fetchall()]
+            review_logs = [dict(r) for r in conn.execute("SELECT * FROM review_logs ORDER BY id").fetchall()]
+            exercise_attempts = [dict(r) for r in conn.execute("SELECT * FROM exercise_attempts ORDER BY id").fetchall()]
+            exam_attempts = [dict(r) for r in conn.execute("SELECT * FROM exam_attempts ORDER BY id").fetchall()]
+            study_notes = [dict(r) for r in conn.execute("SELECT * FROM study_notes ORDER BY id").fetchall()]
+            custom_exercises = [dict(r) for r in conn.execute("SELECT * FROM custom_exercises ORDER BY created_at").fetchall()]
+            content_reports = [dict(r) for r in conn.execute("SELECT * FROM content_reports ORDER BY id").fetchall()]
         return {
             "app": "AprendeLab",
-            "version": 1,
+            "version": 2,
             "exported_at": fsrs.to_iso(fsrs.utc_now()),
             "settings": self.get_settings(),
             "domains": domains,
             "nodes": nodes,
             "learning_items": items,
             "practice_metrics": metrics,
+            "review_logs": review_logs,
+            "exercise_attempts": exercise_attempts,
+            "exam_attempts": exam_attempts,
+            "study_notes": study_notes,
+            "custom_exercises": custom_exercises,
+            "content_reports": content_reports,
+        }
+
+    def restore_backup(self, bundle: dict[str, Any]) -> dict[str, int]:
+        """Restore complete learner progress (settings, FSRS state, review history, metrics, attempts, exams, notes, custom exercises)."""
+        res = self.import_module(bundle)
+        restored_nodes = 0
+        restored_items = 0
+        restored_reviews = 0
+        restored_metrics = 0
+        restored_attempts = 0
+        restored_exams = 0
+        restored_notes = 0
+        restored_custom_ex = 0
+
+        if isinstance(bundle.get("settings"), dict):
+            self.update_settings(bundle["settings"])
+
+        with self.connect() as conn:
+            domain_by_slug = {
+                r["slug"]: r["id"]
+                for r in conn.execute("SELECT id, slug FROM domains").fetchall()
+            }
+            old_domain_slug: dict[Any, str] = {}
+            for d in bundle.get("domains") or []:
+                dslug = d.get("slug") or slugify(d.get("name") or "")
+                if dslug in domain_by_slug:
+                    old_domain_slug[d.get("id")] = dslug
+
+            node_by_slug = {
+                r["slug"]: (r["id"], r["domain_id"])
+                for r in conn.execute("SELECT id, domain_id, slug FROM nodes").fetchall()
+            }
+            old_node_slug: dict[Any, str] = {}
+            for n in bundle.get("nodes") or []:
+                slug = n.get("slug")
+                if not slug or slug not in node_by_slug:
+                    continue
+                old_node_slug[n.get("id")] = slug
+                nid = node_by_slug[slug][0]
+                completed_at = n.get("lesson_completed_at")
+                unlocked = int(n.get("manual_unlocked") or 0)
+                lesson_j = n.get("lesson_json") if isinstance(n.get("lesson_json"), str) else None
+                has_custom_lesson = bool(lesson_j and lesson_j.strip() not in ("", "{}"))
+                if completed_at or unlocked or has_custom_lesson:
+                    conn.execute(
+                        """
+                        UPDATE nodes
+                        SET lesson_completed_at = COALESCE(?, lesson_completed_at),
+                            manual_unlocked = CASE WHEN ? = 1 THEN 1 ELSE manual_unlocked END,
+                            lesson_json = CASE WHEN ? IS NOT NULL AND TRIM(?) NOT IN ('', '{}') THEN ? ELSE lesson_json END
+                        WHERE id = ?
+                        """,
+                        (completed_at, unlocked, lesson_j, lesson_j or "", lesson_j or "{}", nid),
+                    )
+                    restored_nodes += 1
+
+            # Map old learning_item ids -> current learning_item rows so review_logs can be restored accurately
+            old_item_to_cur: dict[Any, tuple[int, int, int]] = {}
+            for it in bundle.get("learning_items") or []:
+                slug = old_node_slug.get(it.get("node_id"))
+                if not slug or slug not in node_by_slug:
+                    continue
+                nid, did = node_by_slug[slug]
+                title = it.get("title") or ""
+                cur_row = conn.execute(
+                    "SELECT id FROM learning_items WHERE node_id = ? AND title = ?",
+                    (nid, title),
+                ).fetchone()
+                if cur_row:
+                    old_item_to_cur[it.get("id")] = (cur_row["id"], did, nid)
+                suspended = int(it.get("suspended") or 0)
+                if int(it.get("reps") or 0) > 0 or (it.get("state") or "new") != "new" or suspended:
+                    cur = conn.execute(
+                        """
+                        UPDATE learning_items
+                        SET state = ?, stability = ?, difficulty = ?, reps = ?, lapses = ?,
+                            due_at = ?, last_review_at = ?, suspended = ?
+                        WHERE node_id = ? AND title = ?
+                        """,
+                        (
+                            it.get("state", "new"),
+                            float(it.get("stability") or 0.0),
+                            float(it.get("difficulty") or 0.0),
+                            int(it.get("reps") or 0),
+                            int(it.get("lapses") or 0),
+                            it.get("due_at"),
+                            it.get("last_review_at"),
+                            suspended,
+                            nid,
+                            title,
+                        ),
+                    )
+                    restored_items += cur.rowcount
+
+            # Restore full review_logs history (drives total_reviews, streak_days, heatmap, calibration, study time)
+            existing_logs = {
+                (r["item_id"], r["created_at"])
+                for r in conn.execute("SELECT item_id, created_at FROM review_logs").fetchall()
+            }
+            for rl in bundle.get("review_logs") or []:
+                mapped = old_item_to_cur.get(rl.get("item_id"))
+                created_at = rl.get("created_at")
+                if not mapped or not created_at:
+                    continue
+                cur_item_id, cur_dom_id, cur_node_id = mapped
+                if (cur_item_id, created_at) in existing_logs:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO review_logs(
+                        item_id, domain_id, node_id, rating, confidence_before,
+                        elapsed_days, duration_sec, feynman_note, prev_state_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cur_item_id,
+                        cur_dom_id,
+                        cur_node_id,
+                        int(rl.get("rating") or 3),
+                        str(rl.get("confidence_before") or ""),
+                        float(rl.get("elapsed_days") or 0.0),
+                        int(rl.get("duration_sec") or 0),
+                        str(rl.get("feynman_note") or ""),
+                        str(rl.get("prev_state_json") or "{}"),
+                        created_at,
+                    ),
+                )
+                existing_logs.add((cur_item_id, created_at))
+                restored_reviews += 1
+
+            # Restore practice_metrics (lab scores, lesson completions, diagnostic logs, streak activity)
+            existing_metrics = {
+                (r["domain_id"], r["metric_type"], r["label"], r["created_at"])
+                for r in conn.execute(
+                    "SELECT domain_id, metric_type, label, created_at FROM practice_metrics"
+                ).fetchall()
+            }
+            for pm in bundle.get("practice_metrics") or []:
+                dslug = old_domain_slug.get(pm.get("domain_id"))
+                if not dslug or dslug not in domain_by_slug:
+                    continue
+                cur_dom_id = domain_by_slug[dslug]
+                nslug = old_node_slug.get(pm.get("node_id")) if pm.get("node_id") is not None else None
+                cur_node_id = node_by_slug[nslug][0] if nslug and nslug in node_by_slug else None
+                created_at = pm.get("created_at")
+                mtype = str(pm.get("metric_type") or "")
+                label = str(pm.get("label") or "")
+                if not created_at or not mtype:
+                    continue
+                mkey = (cur_dom_id, mtype, label, created_at)
+                if mkey in existing_metrics:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO practice_metrics(domain_id, node_id, metric_type, label, value, unit, notes, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cur_dom_id,
+                        cur_node_id,
+                        mtype,
+                        label,
+                        float(pm.get("value") or 0.0),
+                        str(pm.get("unit") or ""),
+                        str(pm.get("notes") or ""),
+                        created_at,
+                    ),
+                )
+                existing_metrics.add(mkey)
+                restored_metrics += 1
+
+            existing_attempts = {
+                (r["exercise_id"], r["created_at"])
+                for r in conn.execute("SELECT exercise_id, created_at FROM exercise_attempts").fetchall()
+            }
+            for att in bundle.get("exercise_attempts") or []:
+                key = (att.get("exercise_id"), att.get("created_at"))
+                if not key[0] or not key[1] or key in existing_attempts:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO exercise_attempts(
+                        exercise_id, node_slug, domain_slug, correct, parts_ok, parts_total,
+                        saw_solution, error_tag, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        att["exercise_id"],
+                        att.get("node_slug", ""),
+                        att.get("domain_slug", ""),
+                        int(att.get("correct") or 0),
+                        int(att.get("parts_ok") or 0),
+                        int(att.get("parts_total") or 0),
+                        int(att.get("saw_solution") or 0),
+                        att.get("error_tag", ""),
+                        att["created_at"],
+                    ),
+                )
+                existing_attempts.add(key)
+                restored_attempts += 1
+
+            existing_exams = {
+                (r["domain_slug"], r["created_at"])
+                for r in conn.execute("SELECT domain_slug, created_at FROM exam_attempts").fetchall()
+            }
+            for ex in bundle.get("exam_attempts") or []:
+                key = (ex.get("domain_slug"), ex.get("created_at"))
+                if not key[0] or not key[1] or key in existing_exams:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO exam_attempts(
+                        domain_slug, mode, title, units_json, score_pct, procedure_score_pct, passed,
+                        correct_count, total_count, duration_sec, time_limit_sec, details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ex["domain_slug"],
+                        ex.get("mode", "general"),
+                        ex.get("title", ""),
+                        ex.get("units_json") if isinstance(ex.get("units_json"), str) else json.dumps(ex.get("units") or [], ensure_ascii=False),
+                        int(ex.get("score_pct") or 0),
+                        ex.get("procedure_score_pct"),
+                        int(ex.get("passed") or 0),
+                        int(ex.get("correct_count") or 0),
+                        int(ex.get("total_count") or 0),
+                        int(ex.get("duration_sec") or 0),
+                        int(ex.get("time_limit_sec") or 0),
+                        ex.get("details_json") if isinstance(ex.get("details_json"), str) else json.dumps(ex.get("details") or [], ensure_ascii=False),
+                        ex["created_at"],
+                    ),
+                )
+                existing_exams.add(key)
+                restored_exams += 1
+
+            for note in bundle.get("study_notes") or []:
+                slug = old_node_slug.get(note.get("node_id"))
+                if not slug or slug not in node_by_slug:
+                    continue
+                nid = node_by_slug[slug][0]
+                conn.execute(
+                    """
+                    INSERT INTO study_notes(node_id, domain_slug, content, bookmarked, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        content = CASE WHEN TRIM(excluded.content) != '' THEN excluded.content ELSE study_notes.content END,
+                        bookmarked = MAX(study_notes.bookmarked, excluded.bookmarked),
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        nid,
+                        note.get("domain_slug", ""),
+                        note.get("content", ""),
+                        int(note.get("bookmarked") or 0),
+                        note.get("updated_at") or fsrs.to_iso(fsrs.utc_now()),
+                    ),
+                )
+                restored_notes += 1
+
+            for cex in bundle.get("custom_exercises") or []:
+                cid = cex.get("id")
+                if not cid:
+                    continue
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO custom_exercises(
+                        id, domain_slug, node_slug, title, level, minutes, statement,
+                        parts_json, hints_json, solution_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cid,
+                        cex.get("domain_slug", ""),
+                        cex.get("node_slug", ""),
+                        cex.get("title", ""),
+                        int(cex.get("level") or 1),
+                        int(cex.get("minutes") or 5),
+                        cex.get("statement", ""),
+                        cex.get("parts_json") if isinstance(cex.get("parts_json"), str) else json.dumps(cex.get("parts") or [], ensure_ascii=False),
+                        cex.get("hints_json") if isinstance(cex.get("hints_json"), str) else json.dumps(cex.get("hints") or [], ensure_ascii=False),
+                        cex.get("solution_json") if isinstance(cex.get("solution_json"), str) else json.dumps(cex.get("solution") or [], ensure_ascii=False),
+                        cex.get("created_at") or fsrs.to_iso(fsrs.utc_now()),
+                    ),
+                )
+                restored_custom_ex += cur.rowcount
+
+        return {
+            **res,
+            "restored_nodes": restored_nodes,
+            "restored_items": restored_items,
+            "restored_reviews": restored_reviews,
+            "restored_metrics": restored_metrics,
+            "restored_attempts": restored_attempts,
+            "restored_exams": restored_exams,
+            "restored_notes": restored_notes,
+            "restored_custom_exercises": restored_custom_ex,
         }
 
     def import_module(self, bundle: dict[str, Any]) -> dict[str, int]:

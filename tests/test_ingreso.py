@@ -6,6 +6,7 @@ import unittest
 
 from backend import ingreso_uncuyo
 from backend.db import Database
+from backend.exercises.registry import EXERCISES, EXERCISES_BY_NODE
 from backend.seed_data import SEED_DOMAINS
 
 
@@ -32,6 +33,16 @@ class TestIngresoMap(unittest.TestCase):
                 self.assertEqual(subject["lessons_done"], 0)
                 self.assertEqual(subject["progress_pct"], 0)
                 self.assertIsNotNone(subject["next_topic"])
+
+    def test_every_official_exercise_belongs_to_a_program_topic(self) -> None:
+        program = ingreso_uncuyo.program_slugs()
+        for ex in EXERCISES:
+            if ex.get("source"):
+                self.assertIn(ex["node"], program, f"{ex['id']} ({ex['source']}) fuera de ingreso_uncuyo")
+
+    def test_every_program_topic_has_exercises(self) -> None:
+        for slug in ingreso_uncuyo.program_slugs():
+            self.assertTrue(EXERCISES_BY_NODE.get(slug), f"Tema del ingreso sin ejercicios: {slug}")
 
 
 if __name__ == "__main__":

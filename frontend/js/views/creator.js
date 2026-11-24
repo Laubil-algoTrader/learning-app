@@ -74,7 +74,6 @@ const STARTER_PACKS = {
   },
 };
 
-/** Editor <-> payload.check conversion (kept to one text field on purpose). */
 function checkToText(check) {
   if (!check) return "";
   if (check.type === "numeric") return String(check.value);
@@ -109,7 +108,18 @@ export async function renderCreator(container) {
   const { domains } = await api.get("/api/domains");
   let selectedSlug = domains[0]?.slug || "";
   let roadmap = selectedSlug ? await api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`) : null;
+  let domExData = selectedSlug ? await api.get(`/api/exercises/${encodeURIComponent(selectedSlug)}`).catch(() => ({ topics: [] })) : { topics: [] };
   let editingItem = null;
+  let editingNode = null;
+  let editingNodeLesson = null;
+
+  const reloadDomain = async () => {
+    if (!selectedSlug) return;
+    [roadmap, domExData] = await Promise.all([
+      api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`),
+      api.get(`/api/exercises/${encodeURIComponent(selectedSlug)}`).catch(() => ({ topics: [] })),
+    ]);
+  };
 
   const installStarterPack = async (packKey) => {
     const pack = STARTER_PACKS[packKey];
@@ -154,20 +164,29 @@ export async function renderCreator(container) {
 
   const paint = () => {
     const nodes = roadmap?.nodes || [];
-    const allNodeItems = nodes.flatMap((n) =>
-      (n.items || []).map((it) => ({ ...it, node_title: n.title }))
+    const allNodeItems = nodes.flatMap((n) => (n.items || []).map((it) => ({ ...it, node_title: n.title })));
+    const customExercises = (domExData?.topics || []).flatMap((t) =>
+      (t.exercises || []).filter((e) => e.custom).map((e) => ({ ...e, topic_title: t.title }))
     );
+
+    const les = editingNodeLesson || {};
+    const lesHook = typeof les.hook === "string" ? les.hook : les.hook?.intuition || "";
+    const lesPoints = (les.concept?.points || []).join("\n");
+    const lesRule = les.concept?.key_rule || "";
+    const lesPitfall = les.concept?.pitfall || "";
+    const lesExTitle = les.example?.title || "";
+    const lesExSteps = (les.example?.steps || []).join("\n");
 
     container.innerHTML = `
       <div class="page-header">
         <div>
           <h1>Editor de materias</h1>
-          <p class="muted">Creá materias nuevas, sumá lecciones y tarjetas a las que ya tenés, y guardá un respaldo de todo.</p>
+          <p class="muted">Creá o editá materias, temas, lecciones completas, ejercicios propios y tarjetas FSRS.</p>
         </div>
         <div class="row">
           <button id="export-btn" class="btn btn-secondary btn-sm" type="button">${icon("download", 14)} Exportar respaldo</button>
           <label class="btn btn-secondary btn-sm" style="cursor:pointer;">
-            ${icon("upload", 14)} Importar
+            ${icon("upload", 14)} Restaurar JSON
             <input id="import-file" type="file" accept=".json,application/json" style="display:none;" />
           </label>
         </div>
@@ -176,9 +195,7 @@ export async function renderCreator(container) {
       <!-- ONE-CLICK PEDAGOGICAL STARTER PACKS -->
       <div class="card card-wash stack" style="margin-bottom:20px;">
         <div class="row-between">
-          <div>
-            <h3 style="margin:0;">Empezar con una plantilla</h3>
-          </div>
+          <div><h3 style="margin:0;">Empezar con una plantilla</h3></div>
           <span class="xs mono muted">Incluyen ruta con prerrequisitos e ítems FSRS</span>
         </div>
         <div class="grid-3">
@@ -200,87 +217,162 @@ export async function renderCreator(container) {
         </div>
       </div>
 
+      <div class="card stack mb-lg">
+        <label class="field">
+          <span>Materia en edición</span>
+          <select id="studio-domain-select">
+            ${domains
+              .map(
+                (d) =>
+                  `<option value="${esc(d.slug)}" ${d.slug === selectedSlug ? "selected" : ""}>${esc(d.name)} (${d.node_count} temas · ${d.item_count} tarjetas)</option>`
+              )
+              .join("")}
+          </select>
+        </label>
+      </div>
+
       <div class="grid-2" style="align-items:start;">
-        <form id="new-domain-form" class="card stack">
-          <h2 class="title-sm">Crear una materia</h2>
-          <label class="field">
-            <span>Nombre de la disciplina</span>
-            <input type="text" name="name" placeholder="Ej: Ajedrez, Cocina, Piano, Historia..." required />
-          </label>
-          <div class="grid-2" style="gap:12px;">
+        <!-- LEFT: Node & Lesson Editor + Custom Exercise Creator -->
+        <div class="stack">
+          <form id="node-editor-form" class="card stack">
+            <div class="row-between">
+              <h2 class="title-sm m-0">${editingNode ? "Editar tema y lección" : "Agregar tema / lección"}</h2>
+              ${editingNode ? `<button id="cancel-node-edit" type="button" class="btn btn-ghost btn-sm">Cancelar</button>` : ""}
+            </div>
             <label class="field">
-              <span>Ícono vectorial</span>
-              <select name="icon">
-                ${DOMAIN_ICON_CHOICES.map((c) => `<option value="${c.key}">${esc(c.label)}</option>`).join("")}
-              </select>
-            </label>
-            <label class="field">
-              <span>Tipo de aprendizaje</span>
-              <select name="domain_type">
-                <option value="mixed">Mixto (teoría + práctica)</option>
-                <option value="motor">Habilidad motora</option>
-                <option value="project">Proyectos / técnico</option>
-                <option value="conceptual">Conceptual / problemas</option>
-              </select>
-            </label>
-          </div>
-          <label class="field">
-            <span>Descripción breve</span>
-            <textarea name="description" placeholder="¿Qué querés dominar y con qué enfoque práctico?"></textarea>
-          </label>
-          <button class="btn btn-primary" type="submit">${icon("plus", 15)} Crear disciplina</button>
-        </form>
-
-        <div class="card stack">
-          <h2 class="title-sm">Agregar contenido</h2>
-          <label class="field">
-            <span>Disciplina seleccionada</span>
-            <select id="studio-domain-select">
-              ${domains
-                .map(
-                  (d) =>
-                    `<option value="${esc(d.slug)}" ${d.slug === selectedSlug ? "selected" : ""}>${esc(d.name)}</option>`
-                )
-                .join("")}
-            </select>
-          </label>
-
-          <form id="new-node-form" class="card-flat stack">
-            <h3>Agregar una lección</h3>
-            <label class="field">
-              <span>Título del nodo</span>
-              <input type="text" name="title" placeholder="Ej: 9. Acordes con cejilla (F y Bm)" required />
+              <span>Título del tema</span>
+              <input type="text" name="title" value="${esc(editingNode?.title || "")}" placeholder="Ej: 9. Ecuaciones trigonométricas" required />
             </label>
             <div class="grid-2" style="gap:10px;">
               <label class="field">
                 <span>Nivel</span>
-                <input type="number" name="level" value="1" min="1" max="10" />
+                <input type="number" name="level" value="${editingNode?.level || 1}" min="1" max="20" />
               </label>
               <label class="field">
-                <span>Prerrequisito (opcional)</span>
+                <span>Prerrequisito</span>
                 <select name="prereq">
                   <option value="">Ninguno</option>
-                  ${nodes.map((n) => `<option value="${esc(n.slug)}">${esc(n.title)}</option>`).join("")}
+                  ${nodes
+                    .filter((n) => !editingNode || n.id !== editingNode.id)
+                    .map(
+                      (n) =>
+                        `<option value="${esc(n.slug)}" ${(editingNode?.prerequisites || []).includes(n.slug) ? "selected" : ""}>${esc(n.title)}</option>`
+                    )
+                    .join("")}
                 </select>
               </label>
             </div>
             <label class="field">
               <span>Resumen</span>
-              <input type="text" name="summary" placeholder="Qué habilidad concreta desbloquea este nodo" />
+              <input type="text" name="summary" value="${esc(editingNode?.summary || "")}" placeholder="Qué habilidad concreta enseña este tema" />
             </label>
-            <button class="btn btn-secondary btn-sm" type="submit">${icon("plus", 14)} Agregar nodo</button>
+            <details ${editingNode ? "open" : ""}>
+              <summary class="link small" style="cursor:pointer;">Contenido de la lección (idea, puntos, fórmula clave, ejemplo)</summary>
+              <div class="stack-sm mt-sm">
+                <label class="field">
+                  <span>Idea / intuición inicial</span>
+                  <textarea name="lesson_hook" rows="2" placeholder="¿Por qué sirve este tema?">${esc(lesHook)}</textarea>
+                </label>
+                <label class="field">
+                  <span>Puntos clave (uno por línea)</span>
+                  <textarea name="lesson_points" rows="3" placeholder="Paso o propiedad 1&#10;Paso o propiedad 2">${esc(lesPoints)}</textarea>
+                </label>
+                <label class="field">
+                  <span>Regla o fórmula clave (aparece en el Formulario)</span>
+                  <input type="text" name="lesson_rule" value="${esc(lesRule)}" placeholder="Ej: \`v = v_0 + a·t\`" />
+                </label>
+                <label class="field">
+                  <span>Error típico</span>
+                  <input type="text" name="lesson_pitfall" value="${esc(lesPitfall)}" placeholder="Qué trampa evitar en el examen" />
+                </label>
+                <label class="field">
+                  <span>Título del ejemplo</span>
+                  <input type="text" name="lesson_ex_title" value="${esc(lesExTitle)}" placeholder="Ej: Calcular el tiempo de frenado" />
+                </label>
+                <label class="field">
+                  <span>Pasos del ejemplo (uno por línea)</span>
+                  <textarea name="lesson_ex_steps" rows="2" placeholder="Paso 1...&#10;Paso 2...">${esc(lesExSteps)}</textarea>
+                </label>
+              </div>
+            </details>
+            <button class="btn btn-primary btn-sm" type="submit">${editingNode ? "Guardar tema y lección" : `${icon("plus", 14)} Crear tema`}</button>
           </form>
 
-          <form id="new-item-form" class="card-flat stack">
+          <form id="custom-ex-form" class="card stack">
+            <h2 class="title-sm m-0">Crear ejercicio propio</h2>
+            <p class="xs muted m-0">Se suma al tema elegido, entra en los simulacros y aparece en el banco de errores si lo fallás.</p>
+            <div class="grid-2" style="gap:10px;">
+              <label class="field">
+                <span>Tema</span>
+                <select name="node_id" required>
+                  ${nodes.map((n) => `<option value="${n.id}">${esc(n.title)}</option>`).join("")}
+                </select>
+              </label>
+              <label class="field">
+                <span>Nivel</span>
+                <select name="level">
+                  <option value="1">1 · Básico</option>
+                  <option value="2">2 · Intermedio</option>
+                  <option value="3">3 · Tipo examen</option>
+                </select>
+              </label>
+            </div>
+            <label class="field">
+              <span>Título del ejercicio</span>
+              <input type="text" name="title" placeholder="Ej: Parcial 2025 · Bloque con rozamiento" required />
+            </label>
+            <label class="field">
+              <span>Enunciado</span>
+              <textarea name="statement" rows="3" placeholder="Escribí los datos y el problema completo…" required></textarea>
+            </label>
+            <label class="field">
+              <span>Pregunta / inciso</span>
+              <input type="text" name="part_prompt" placeholder="Ej: Calculá la aceleración en m/s²." required />
+            </label>
+            <div class="grid-2" style="gap:10px;">
+              <label class="field">
+                <span>Tipo de corrección</span>
+                <select name="check_type">
+                  <option value="numeric">Numérica</option>
+                  <option value="text">Texto corto</option>
+                  <option value="choice">Opción múltiple</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Respuesta esperada</span>
+                <input type="text" name="check_value" placeholder="2.5 · o: correcta | distractor1 | distractor2" required />
+              </label>
+            </div>
+            <div class="grid-2" style="gap:10px;">
+              <label class="field">
+                <span>Unidad (opcional)</span>
+                <input type="text" name="unit" placeholder="m/s², N, cm…" />
+              </label>
+              <label class="field">
+                <span>Pista (opcional)</span>
+                <input type="text" name="hint" placeholder="Planteá primero ∑F = m·a" />
+              </label>
+            </div>
+            <label class="field">
+              <span>Resolución paso a paso (una línea por paso)</span>
+              <textarea name="solution" rows="2" placeholder="1) Descomponemos el peso...&#10;2) Despejamos a = ..."></textarea>
+            </label>
+            <button class="btn btn-primary btn-sm" type="submit">${icon("plus", 14)} Guardar ejercicio</button>
+          </form>
+        </div>
+
+        <!-- RIGHT: Flashcard Editor + Create New Domain -->
+        <div class="stack">
+          <form id="new-item-form" class="card stack">
             <div class="row-between">
-              <h3>${editingItem ? "Editar tarjeta" : "Agregar una tarjeta"}</h3>
+              <h2 class="title-sm m-0">${editingItem ? "Editar tarjeta FSRS" : "Agregar una tarjeta FSRS"}</h2>
               ${editingItem ? `<button id="cancel-edit" type="button" class="btn btn-ghost btn-sm">Cancelar edición</button>` : ""}
             </div>
             ${
               !editingItem
                 ? `<div class="grid-2" style="gap:10px;">
                     <label class="field">
-                      <span>Nodo destino</span>
+                      <span>Tema destino</span>
                       <select name="node_id" required>
                         ${nodes.map((n) => `<option value="${n.id}">${esc(n.title)}</option>`).join("")}
                       </select>
@@ -333,28 +425,107 @@ export async function renderCreator(container) {
                 <input type="text" name="check_value" value="${esc(checkToText(editingItem?.payload?.check))}" placeholder="220 · o: correcta | otra | otra" />
               </label>
             </div>
-            <p class="xs muted m-0">Número: solo el valor. Texto: respuestas aceptadas separadas por «|». Opción múltiple: la correcta primero y después las incorrectas, separadas por «|».</p>
             <button class="btn btn-primary btn-sm" type="submit">${editingItem ? "Guardar cambios" : "Guardar tarjeta"}</button>
+          </form>
+
+          <form id="new-domain-form" class="card stack">
+            <h2 class="title-sm m-0">Crear una materia nueva</h2>
+            <label class="field">
+              <span>Nombre de la disciplina</span>
+              <input type="text" name="name" placeholder="Ej: Química, Álgebra lineal, Piano…" required />
+            </label>
+            <div class="grid-2" style="gap:12px;">
+              <label class="field">
+                <span>Ícono vectorial</span>
+                <select name="icon">
+                  ${DOMAIN_ICON_CHOICES.map((c) => `<option value="${c.key}">${esc(c.label)}</option>`).join("")}
+                </select>
+              </label>
+              <label class="field">
+                <span>Tipo de aprendizaje</span>
+                <select name="domain_type">
+                  <option value="mixed">Mixto (teoría + práctica)</option>
+                  <option value="motor">Habilidad motora</option>
+                  <option value="project">Proyectos / técnico</option>
+                  <option value="conceptual">Conceptual / problemas</option>
+                </select>
+              </label>
+            </div>
+            <label class="field">
+              <span>Descripción breve</span>
+              <textarea name="description" rows="2" placeholder="¿Qué querés dominar y con qué enfoque práctico?"></textarea>
+            </label>
+            <button class="btn btn-secondary btn-sm" type="submit">${icon("plus", 15)} Crear materia</button>
           </form>
         </div>
       </div>
 
+      <!-- TOPICS LIST (EDIT / DELETE NODES & LESSONS) -->
       <div class="card stack" style="margin-top:20px;">
-        <div class="row-between">
-          <div>
-            <h3 style="margin:0;">Tarjetas de ${esc(roadmap?.domain?.name || "")} (${allNodeItems.length})</h3>
-          </div>
+        <h3 class="m-0">Temas y lecciones de ${esc(roadmap?.domain?.name || "")} (${nodes.length})</h3>
+        <div class="stack" style="gap:7px;max-height:320px;overflow-y:auto;">
+          ${nodes
+            .map(
+              (n) => `
+            <div class="card-flat row-between">
+              <div style="min-width:0;">
+                <div class="small" style="font-weight:600;">${esc(n.title)}</div>
+                <div class="xs muted truncate">${esc(n.summary || "Sin resumen")} · Nivel ${n.level} · ${(n.items || []).length} tarjetas</div>
+              </div>
+              <div class="row">
+                <a href="#/learn/${n.id}" class="btn btn-ghost btn-sm">Ver</a>
+                <button type="button" class="btn btn-secondary btn-sm edit-node-btn" data-id="${n.id}">Editar</button>
+                <button type="button" class="btn btn-danger btn-sm del-node-btn" data-id="${n.id}" data-title="${esc(n.title)}">${icon("trash", 13)}</button>
+              </div>
+            </div>`
+            )
+            .join("")}
         </div>
-        <div class="stack" style="gap:7px;max-height:360px;overflow-y:auto;">
+      </div>
+
+      ${
+        customExercises.length
+          ? `<div class="card stack" style="margin-top:20px;">
+              <h3 class="m-0">Tus ejercicios propios en ${esc(roadmap?.domain?.name || "")} (${customExercises.length})</h3>
+              <div class="stack" style="gap:7px;">
+                ${customExercises
+                  .map(
+                    (ex) => `
+                  <div class="card-flat row-between">
+                    <div style="min-width:0;">
+                      <div class="small" style="font-weight:600;">${esc(ex.title)}</div>
+                      <div class="xs muted">${esc(ex.topic_title)} · Nivel ${ex.level}</div>
+                    </div>
+                    <div class="row">
+                      <a href="#/ejercicios/${esc(selectedSlug)}/${esc(ex.node)}?e=${esc(ex.id)}" class="btn btn-ghost btn-sm">Abrir</a>
+                      <button type="button" class="btn btn-danger btn-sm del-custom-ex-btn" data-id="${esc(ex.id)}">${icon("trash", 13)}</button>
+                    </div>
+                  </div>`
+                  )
+                  .join("")}
+              </div>
+            </div>`
+          : ""
+      }
+
+      <!-- CARDS LIST -->
+      <div class="card stack" style="margin-top:20px;">
+        <h3 class="m-0">Tarjetas FSRS de ${esc(roadmap?.domain?.name || "")} (${allNodeItems.length})</h3>
+        <div class="stack" style="gap:7px;max-height:320px;overflow-y:auto;">
           ${allNodeItems
             .map(
               (it) => `
             <div class="card-flat row-between">
               <div style="min-width:0;">
-                <div class="small" style="font-weight:600;">${esc(it.title)}</div>
+                <div class="small" style="font-weight:600;">${esc(it.title)} ${it.suspended ? `<span class="pill pill-amber xs">Suspendida</span>` : ""}</div>
                 <div class="xs mono muted">${esc(it.node_title)} · ${esc(it.item_type)} · S: ${it.stability}d</div>
               </div>
               <div class="row">
+                ${
+                  it.suspended
+                    ? `<button type="button" class="btn btn-secondary btn-sm unsuspend-item-btn" data-id="${it.id}">Reactivar</button>`
+                    : ""
+                }
                 <button type="button" class="btn btn-ghost btn-sm edit-item-btn" data-id="${it.id}">Editar</button>
                 <button type="button" class="btn btn-danger btn-sm del-item-btn" data-id="${it.id}">${icon("trash", 13)}</button>
               </div>
@@ -364,6 +535,7 @@ export async function renderCreator(container) {
         </div>
       </div>
 
+      <!-- DOMAINS LIST -->
       <div class="card" style="margin-top:20px;">
         <h3 style="margin-bottom:12px;">Tus materias (${domains.length})</h3>
         <div class="stack" style="gap:8px;">
@@ -401,13 +573,78 @@ export async function renderCreator(container) {
     container.querySelector("#studio-domain-select")?.addEventListener("change", async (e) => {
       selectedSlug = e.target.value;
       editingItem = null;
-      roadmap = await api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`);
+      editingNode = null;
+      editingNodeLesson = null;
+      await reloadDomain();
       paint();
     });
 
     container.querySelector("#cancel-edit")?.addEventListener("click", () => {
       editingItem = null;
       paint();
+    });
+    container.querySelector("#cancel-node-edit")?.addEventListener("click", () => {
+      editingNode = null;
+      editingNodeLesson = null;
+      paint();
+    });
+
+    container.querySelectorAll(".edit-node-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const nid = Number(btn.dataset.id);
+        editingNode = nodes.find((x) => x.id === nid) || null;
+        try {
+          const lesData = await api.get(`/api/nodes/${nid}/lesson`);
+          editingNodeLesson = lesData.lesson || null;
+        } catch {
+          editingNodeLesson = null;
+        }
+        paint();
+        container.querySelector("#node-editor-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    });
+
+    container.querySelectorAll(".del-node-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (!window.confirm(`¿Eliminar el tema «${btn.dataset.title}» junto con sus tarjetas y ejercicios propios?`)) return;
+        try {
+          await api.del(`/api/nodes/${btn.dataset.id}`);
+          if (editingNode?.id === Number(btn.dataset.id)) {
+            editingNode = null;
+            editingNodeLesson = null;
+          }
+          toast("Tema eliminado", "ok");
+          await reloadDomain();
+          await refreshSidebarDomains();
+          paint();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
+    });
+
+    container.querySelectorAll(".del-custom-ex-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (!window.confirm("¿Eliminar este ejercicio propio?")) return;
+        try {
+          await api.del(`/api/exercises/custom/${encodeURIComponent(btn.dataset.id)}`);
+          toast("Ejercicio eliminado", "ok");
+          await reloadDomain();
+          paint();
+        } catch (err) {
+          toast(err.message, "err");
+        }
+      });
+    });
+
+    container.querySelectorAll(".unsuspend-item-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await api.put(`/api/items/${btn.dataset.id}`, { suspended: false });
+        toast("Tarjeta reactivada", "ok");
+        await reloadDomain();
+        await refreshSidebarDomains();
+        paint();
+      });
     });
 
     container.querySelectorAll(".edit-item-btn").forEach((btn) => {
@@ -423,7 +660,7 @@ export async function renderCreator(container) {
         if (!confirm("¿Eliminar este ítem de estudio?")) return;
         await api.del(`/api/items/${btn.dataset.id}`);
         toast("Tarjeta eliminada", "ok");
-        roadmap = await api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`);
+        await reloadDomain();
         await refreshSidebarDomains();
         paint();
       });
@@ -448,21 +685,121 @@ export async function renderCreator(container) {
       }
     });
 
-    container.querySelector("#new-node-form")?.addEventListener("submit", async (e) => {
+    container.querySelector("#node-editor-form")?.addEventListener("submit", async (e) => {
       e.preventDefault();
       if (!roadmap?.domain?.id) return;
       const fd = new FormData(e.target);
-      const prereq = fd.get("prereq");
+      const prereq = String(fd.get("prereq") || "").trim();
+      const hookTxt = String(fd.get("lesson_hook") || "").trim();
+      const pointsArr = String(fd.get("lesson_points") || "")
+        .split("\n")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const keyRule = String(fd.get("lesson_rule") || "").trim();
+      const pitfall = String(fd.get("lesson_pitfall") || "").trim();
+      const exTitle = String(fd.get("lesson_ex_title") || "").trim();
+      const exSteps = String(fd.get("lesson_ex_steps") || "")
+        .split("\n")
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+      const hasLessonFields = Boolean(hookTxt || pointsArr.length || keyRule || pitfall || exTitle || exSteps.length);
+      const lessonPayload = hasLessonFields
+        ? {
+            ...(editingNodeLesson || {}),
+            hook: {
+              question: (editingNodeLesson?.hook && typeof editingNodeLesson.hook === "object" ? editingNodeLesson.hook.question : "") || `¿Qué resuelve «${fd.get("title")}»?`,
+              intuition: hookTxt || String(fd.get("summary") || ""),
+            },
+            concept: {
+              ...(editingNodeLesson?.concept || {}),
+              points: pointsArr.length ? pointsArr : editingNodeLesson?.concept?.points || [String(fd.get("summary") || fd.get("title"))],
+              key_rule: keyRule || editingNodeLesson?.concept?.key_rule || String(fd.get("title")),
+              pitfall: pitfall || editingNodeLesson?.concept?.pitfall || "Verificá signos, unidades y dominio antes de cerrar la cuenta.",
+            },
+            example: {
+              ...(editingNodeLesson?.example || {}),
+              title: exTitle || editingNodeLesson?.example?.title || "Ejemplo resuelto",
+              steps: exSteps.length ? exSteps : editingNodeLesson?.example?.steps || ["Aplicá la regla paso a paso y comprobá el resultado."],
+            },
+          }
+        : undefined;
+
       try {
-        await api.post("/api/nodes", {
-          domain_id: roadmap.domain.id,
+        if (editingNode) {
+          await api.put(`/api/nodes/${editingNode.id}`, {
+            title: fd.get("title"),
+            level: Number(fd.get("level") || 1),
+            summary: fd.get("summary"),
+            prerequisites: prereq ? [prereq] : [],
+            ...(lessonPayload ? { lesson: lessonPayload } : {}),
+          });
+          toast("Tema y lección actualizados", "ok");
+          editingNode = null;
+          editingNodeLesson = null;
+        } else {
+          const created = await api.post("/api/nodes", {
+            domain_id: roadmap.domain.id,
+            title: fd.get("title"),
+            level: Number(fd.get("level") || 1),
+            summary: fd.get("summary"),
+            prerequisites: prereq ? [prereq] : [],
+          });
+          if (lessonPayload && created.node?.id) {
+            await api.put(`/api/nodes/${created.node.id}`, { lesson: lessonPayload });
+          }
+          toast("Tema y lección creados", "ok");
+        }
+        await reloadDomain();
+        paint();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+
+    container.querySelector("#custom-ex-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const checkType = String(fd.get("check_type") || "numeric");
+      const checkRaw = String(fd.get("check_value") || "");
+      const unit = String(fd.get("unit") || "").trim();
+      let check;
+      try {
+        check = textToCheck(checkType, checkRaw);
+        if (unit && check) check.unit = unit;
+      } catch (err) {
+        toast(err.message, "err");
+        return;
+      }
+      const answerDisplay =
+        check.type === "choice"
+          ? check.options[0]
+          : check.type === "numeric"
+          ? `${check.value}${unit ? " " + unit : ""}`
+          : check.accept[0];
+      const hint = String(fd.get("hint") || "").trim();
+      const solSteps = String(fd.get("solution") || "")
+        .split("\n")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      try {
+        await api.post("/api/exercises/custom", {
+          node_id: Number(fd.get("node_id")),
           title: fd.get("title"),
           level: Number(fd.get("level") || 1),
-          summary: fd.get("summary"),
-          prerequisites: prereq ? [prereq] : [],
+          statement: fd.get("statement"),
+          parts: [
+            {
+              prompt: String(fd.get("part_prompt") || "").trim(),
+              answer: answerDisplay,
+              check,
+            },
+          ],
+          hints: hint ? [hint] : [],
+          solution: solSteps.length ? solSteps : [`Respuesta: ${answerDisplay}`],
         });
-        toast("Lección agregada", "ok");
-        roadmap = await api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`);
+        toast("Ejercicio propio guardado", "ok");
+        await reloadDomain();
         paint();
       } catch (err) {
         toast(err.message, "err");
@@ -503,7 +840,7 @@ export async function renderCreator(container) {
           });
           toast("Tarjeta guardada", "ok");
         }
-        roadmap = await api.get(`/api/domains/${encodeURIComponent(selectedSlug)}/roadmap`);
+        await reloadDomain();
         await refreshSidebarDomains();
         paint();
       } catch (err) {
@@ -539,15 +876,15 @@ export async function renderCreator(container) {
       try {
         const text = await file.text();
         const json = JSON.parse(text);
-        const res = await api.post("/api/import", json);
+        const { restored } = await api.post("/api/backup/restore", json);
         toast(
-          `Importado: +${res.imported.added_domains} materias, +${res.imported.added_nodes} nodos, +${res.imported.added_items} ítems`,
+          `Restaurado: ${restored.restored_nodes || 0} temas, ${restored.restored_reviews || 0} repasos, ${restored.restored_attempts || 0} intentos, ${restored.restored_exams || 0} simulacros.`,
           "ok"
         );
         await refreshSidebarDomains();
         renderCreator(container);
       } catch (err) {
-        toast(`Error al importar: ${err.message}`, "err");
+        toast(`Error al restaurar: ${err.message}`, "err");
       }
     });
   };

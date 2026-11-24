@@ -139,6 +139,7 @@ export function renderActiveRecallCard(host, item, options = {}) {
     noSchedule = false,
     isRetry = false,
     onRated = () => {},
+    onSuspended = null,
   } = options;
 
   const startedAt = Date.now();
@@ -498,11 +499,19 @@ export function renderActiveRecallCard(host, item, options = {}) {
               ${isRetry ? `<span class="pill pill-amber">Segundo intento</span>` : ""}
               ${isLeech ? `<span class="pill pill-red">Te cuesta: ${item.lapses} olvidos</span>` : ""}
             </div>
-            ${
-              deepLab
-                ? `<a href="${deepLab}" class="btn btn-secondary btn-sm" data-lab-link>${icon("flask", 14)} ${labMetric ? "Hacerlo en el laboratorio" : "Abrir laboratorio"}</a>`
-                : ""
-            }
+            <div class="row gap-sm">
+              ${
+                deepLab
+                  ? `<a href="${deepLab}" class="btn btn-secondary btn-sm" data-lab-link>${icon("flask", 14)} ${labMetric ? "Hacerlo en el laboratorio" : "Abrir laboratorio"}</a>`
+                  : ""
+              }
+              ${
+                onSuspended
+                  ? `<button type="button" class="btn btn-text btn-sm muted" id="card-suspend-btn" title="Suspender tarjeta (no vuelve a aparecer hasta reactivarla en Ajustes)">Suspender</button>`
+                  : ""
+              }
+              <button type="button" class="btn btn-text btn-sm muted" id="card-report-btn" title="Reportar error de contenido">${icon("alert", 13)}</button>
+            </div>
           </div>
 
           ${phaseTip ? `<p class="small muted m-0">${esc(phaseLabel ? phaseLabel + ": " : "")}${esc(phaseTip)}</p>` : ""}
@@ -586,6 +595,28 @@ export function renderActiveRecallCard(host, item, options = {}) {
     );
     host.querySelectorAll("[data-rating]").forEach((b) => b.addEventListener("click", () => submitRating(Number(b.dataset.rating))));
     if (noSchedule) host.querySelector("#finish-block")?.addEventListener("click", finishWithoutSchedule);
+    host.querySelector("#card-suspend-btn")?.addEventListener("click", async () => {
+      if (!window.confirm("¿Suspender esta tarjeta? Dejará de aparecer en tus repasos hasta que la reactives desde Ajustes o el Editor.")) return;
+      try {
+        await api.put(`/api/items/${item.id}`, { suspended: true });
+        await refreshSidebarDomains();
+        toast("Tarjeta suspendida", "info");
+        detachKeys();
+        if (onSuspended) onSuspended(item);
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+    host.querySelector("#card-report-btn")?.addEventListener("click", async () => {
+      const msg = window.prompt(`¿Qué error encontraste en la tarjeta «${item.title}»?`);
+      if (!msg || !msg.trim()) return;
+      try {
+        await api.post("/api/reports", { kind: "card", target_id: String(item.id), title: item.title, message: msg.trim() });
+        toast("Reporte guardado (visible en Ajustes)", "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
     firstPaint = false;
   }
 
@@ -607,6 +638,7 @@ export async function renderReview(container, { domain = null, node = null, mode
   const { items: fetched, meta } = await api.get(`/api/reviews/due?${qs.toString()}`);
 
   const queue = fetched.map((it) => ({ item: it, retry: 0 }));
+  const undoStack = []; // { idx, entry, reviewLogId, requeuedAt, wasDone, wasFailedOnce }
   let idx = 0;
   let done = 0;
   let failedOnce = 0;
@@ -655,6 +687,11 @@ export async function renderReview(container, { domain = null, node = null, mode
             <h1 class="title-md" style="font-size:clamp(2rem,4vw,3rem);">${esc(title)}</h1>
           </div>
           <div class="row">
+            ${
+              undoStack.length
+                ? `<button type="button" id="review-undo-btn" class="btn btn-secondary btn-sm">${icon("refresh", 14)} Deshacer última</button>`
+                : ""
+            }
             ${node || mode ? `<a href="#/review" class="btn btn-secondary btn-sm">Repaso de hoy</a>` : ""}
             ${
               !node
@@ -680,6 +717,26 @@ export async function renderReview(container, { domain = null, node = null, mode
         <div id="review-stage"></div>
       </div>
     `;
+
+    container.querySelector("#review-undo-btn")?.addEventListener("click", async () => {
+      const last = undoStack.pop();
+      if (!last) return;
+      try {
+        const res = await api.post("/api/reviews/undo", { review_log_id: last.reviewLogId });
+        if (last.requeuedAt !== null && last.requeuedAt < queue.length) {
+          queue.splice(last.requeuedAt, 1);
+        }
+        if (last.wasDone) done = Math.max(0, done - 1);
+        if (last.wasFailedOnce) failedOnce = Math.max(0, failedOnce - 1);
+        idx = last.idx;
+        if (res.item) queue[idx] = { item: res.item, retry: last.entry.retry };
+        await refreshSidebarDomains();
+        toast("Última calificación deshecha", "ok");
+        paint();
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
 
     container.querySelector("#domain-filter")?.addEventListener("change", (e) => {
       const val = e.target.value;
@@ -712,13 +769,27 @@ export async function renderReview(container, { domain = null, node = null, mode
     const entry = queue[idx];
     activeDetach = renderActiveRecallCard(stage, entry.item, {
       isRetry: entry.retry > 0,
+      onSuspended: () => {
+        queue.splice(idx, 1);
+        paint();
+      },
       onRated: (res) => {
+        let requeuedAt = null;
+        let wasDone = false;
+        let wasFailedOnce = false;
         if (res.rating === 1 && entry.retry < 3) {
-          // Failed cards come back later in this same session until they stick
-          if (entry.retry === 0) failedOnce += 1;
-          queue.splice(requeuePosition(idx, queue.length), 0, { item: res.item, retry: entry.retry + 1 });
+          if (entry.retry === 0) {
+            failedOnce += 1;
+            wasFailedOnce = true;
+          }
+          requeuedAt = requeuePosition(idx, queue.length);
+          queue.splice(requeuedAt, 0, { item: res.item, retry: entry.retry + 1 });
         } else {
           done += 1;
+          wasDone = true;
+        }
+        if (res.review_log_id) {
+          undoStack.push({ idx, entry, reviewLogId: res.review_log_id, requeuedAt, wasDone, wasFailedOnce });
         }
         idx += 1;
         paint();

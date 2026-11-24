@@ -1,4 +1,5 @@
 import { icon, resolveDomainIcon } from "./icons.js";
+import { formatInlineCode } from "./math_render.js";
 import { renderDashboard } from "./views/dashboard.js";
 import { renderLearnIndex, renderLabsIndex } from "./views/library.js";
 import { renderSettings } from "./views/settings.js";
@@ -7,8 +8,10 @@ import { renderLearn } from "./views/learn.js";
 import { renderReview } from "./views/review.js";
 import { renderSession } from "./views/session.js";
 import { renderCreator } from "./views/creator.js";
-import { renderExercisesIndex, renderExerciseDomain, renderExerciseTopic, renderExerciseExam } from "./views/exercises.js";
+import { renderExercisesIndex, renderExerciseDomain, renderExerciseTopic, renderExerciseExam, renderExerciseRetries } from "./views/exercises.js";
 import { renderIngreso } from "./views/ingreso.js";
+import { renderCheatsheet, renderErrorBank, renderNotebook } from "./views/study_hub.js";
+import { renderDiagnostic } from "./views/diagnostic.js";
 import { renderGuitarLab } from "./labs/guitar_lab.js";
 import { renderElectronicsLab } from "./labs/electronics_lab.js";
 import { renderMathLab } from "./labs/math_lab.js";
@@ -54,13 +57,19 @@ export function esc(str) {
 }
 
 /**
- * Tiny safe formatter for authored content: escapes HTML, then allows **bold**,
- * `code` and line breaks. Enough for lessons/cards without pulling a Markdown lib.
+ * Tiny safe formatter for authored content: escapes HTML, allows **bold**,
+ * typographic math/code `spans` and line breaks without pulling a Markdown lib.
  */
 const richInline = (line) =>
-  esc(line)
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+  String(line ?? "")
+    .split(/(`[^`]+`)/g)
+    .map((part) => {
+      if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
+        return formatInlineCode(part.slice(1, -1));
+      }
+      return esc(part).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    })
+    .join("");
 
 const TABLE_ROW = /^\s*\|.*\|\s*$/;
 const TABLE_RULE = /^\s*\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{0,}:?\s*$/;
@@ -243,6 +252,9 @@ function renderMenu() {
   const dark = currentTheme() === "dark";
   pop.innerHTML = `
     <a class="menu-item" role="menuitem" href="#/session">${icon("zap", 18)}<span>Sesión guiada</span></a>
+    <a class="menu-item" role="menuitem" href="#/formulario">${icon("book", 18)}<span>Formulario imprimible</span></a>
+    <a class="menu-item" role="menuitem" href="#/errores">${icon("alert", 18)}<span>Banco de errores</span></a>
+    <a class="menu-item" role="menuitem" href="#/cuaderno">${icon("pen", 18)}<span>Cuaderno de estudio</span></a>
     <a class="menu-item" role="menuitem" href="#/creator">${icon("layers", 18)}<span>Editor de materias</span></a>
     <a class="menu-item" role="menuitem" href="#/ajustes">${icon("settings", 18)}<span>Ajustes</span></a>
     <button class="menu-item" role="menuitem" type="button" id="menu-theme">${icon(dark ? "sun" : "moon", 18)}<span>${dark ? "Tema claro" : "Tema oscuro"}</span></button>
@@ -289,7 +301,14 @@ function highlightActiveNav() {
   const { path } = parseRoute();
   let key = "hoy";
   if (path.startsWith("/review")) key = "review";
-  else if (path.startsWith("/ingreso")) key = "ingreso";
+  else if (
+    path.startsWith("/ingreso") ||
+    path.startsWith("/formulario") ||
+    path.startsWith("/errores") ||
+    path.startsWith("/cuaderno") ||
+    path.startsWith("/diagnostico")
+  )
+    key = "ingreso";
   else if (path.startsWith("/ejercicios")) key = "ejercicios";
   else if (path.startsWith("/lab")) key = "labs";
   else if (path.startsWith("/aprender") || path.startsWith("/roadmap/") || path.startsWith("/learn/")) key = "aprender";
@@ -346,10 +365,27 @@ async function renderRoute() {
     } else if (path.startsWith("/aprender")) {
       await renderLearnIndex(container);
     } else if (path.startsWith("/ingreso")) {
-      await renderIngreso(container);
+      await renderIngreso(container, {
+        subject: params.get("materia") || null,
+        unit: params.get("unidad") || null,
+      });
+    } else if (path.startsWith("/formulario")) {
+      const domainSlug = decodeURIComponent(path.split("/")[2] || "") || "matematicas";
+      await renderCheatsheet(container, domainSlug, { ingresoOnly: params.get("all") !== "1" });
+    } else if (path.startsWith("/errores")) {
+      await renderErrorBank(container, { domain: params.get("domain") || null });
+    } else if (path.startsWith("/cuaderno")) {
+      await renderNotebook(container, {
+        domain: params.get("domain") || null,
+        bookmarked: params.get("bookmarked") === "1",
+      });
+    } else if (path.startsWith("/diagnostico")) {
+      const domainSlug = decodeURIComponent(path.split("/")[2] || "") || "matematicas";
+      await renderDiagnostic(container, domainSlug);
     } else if (path.startsWith("/ejercicios")) {
       const [, , domainSlug, topicSlug] = path.split("/").map((seg) => decodeURIComponent(seg || ""));
       if (!domainSlug) await renderExercisesIndex(container);
+      else if (domainSlug === "reintentos") await renderExerciseRetries(container, { domain: params.get("domain") || null });
       else if (!topicSlug) await renderExerciseDomain(container, domainSlug);
       else if (topicSlug === "simulacro") await renderExerciseExam(container, domainSlug, { ingreso: params.get("ingreso") === "1" });
       else await renderExerciseTopic(container, domainSlug, topicSlug, { exerciseId: params.get("e") || null });
@@ -410,6 +446,15 @@ let cmdSelected = 0;
 
 async function buildCommandEntries() {
   const base = [
+    { label: "Ingreso a Ingeniería (UNCuyo 2027)", meta: "Programa oficial", ico: "target", hash: "#/ingreso" },
+    { label: "Formulario de Matemática (imprimible)", meta: "Resumen", ico: "math", hash: "#/formulario/matematicas" },
+    { label: "Formulario de Física (imprimible)", meta: "Resumen", ico: "physics", hash: "#/formulario/fisica" },
+    { label: "Formulario de Comprensión Lectora", meta: "Resumen", ico: "book", hash: "#/formulario/comprension-problemas" },
+    { label: "Banco de errores y puntos débiles", meta: "Práctica", ico: "alert", hash: "#/errores" },
+    { label: "Cuaderno de estudio y temas marcados", meta: "Apuntes", ico: "pen", hash: "#/cuaderno" },
+    { label: "Diagnóstico de nivel: Matemática", meta: "Evaluación", ico: "math", hash: "#/diagnostico/matematicas" },
+    { label: "Diagnóstico de nivel: Física", meta: "Evaluación", ico: "physics", hash: "#/diagnostico/fisica" },
+    { label: "Diagnóstico de nivel: Comprensión Lectora", meta: "Evaluación", ico: "book", hash: "#/diagnostico/comprension-problemas" },
     { label: "Repasar lo de hoy", meta: "Repaso", ico: "brain", hash: "#/review" },
     { label: "Empezar una sesión guiada", meta: "Sesión", ico: "zap", hash: "#/session" },
     { label: "Guitarra: metrónomo y escalera de tempo", meta: "Laboratorio", ico: "guitar", hash: "#/lab/guitar?tab=metronome" },
@@ -464,52 +509,67 @@ async function openCommandPalette() {
   if (!modal) return;
   modal.hidden = false;
 
+  let remoteResults = [];
+  let searchTimer = null;
+  let searchSeq = 0;
+
   const renderList = (query = "") => {
     const q = query.trim().toLowerCase();
-    const filtered = q
+    const localFiltered = q
       ? cmdEntries.filter(
           (e) => e.label.toLowerCase().includes(q) || e.meta.toLowerCase().includes(q)
         )
       : cmdEntries.slice(0, 14);
-    cmdSelected = Math.min(cmdSelected, Math.max(0, filtered.length - 1));
+    const seen = new Set(localFiltered.map((x) => `${x.hash}|${x.label}`));
+    const merged = q.length >= 2
+      ? [
+          ...localFiltered.slice(0, 6),
+          ...remoteResults.filter((r) => !seen.has(`${r.hash}|${r.label}`)),
+        ].slice(0, 18)
+      : localFiltered;
+
+    cmdSelected = Math.min(cmdSelected, Math.max(0, merged.length - 1));
     const listEl = modal.querySelector(".cmd-list");
-    if (!filtered.length) {
+    if (!merged.length) {
       listEl.innerHTML = `<div class="muted center" style="padding:24px;">Sin resultados para «${esc(query)}»</div>`;
-      return filtered;
+      return merged;
     }
-    listEl.innerHTML = filtered
+    listEl.innerHTML = merged
       .map(
         (item, i) => `
       <button type="button" class="cmd-item ${i === cmdSelected ? "selected" : ""}" data-idx="${i}">
-        <span class="row" style="gap:10px;">
-          ${icon(item.ico, 15)}
-          <span>${esc(item.label)}</span>
+        <span class="row" style="gap:10px;min-width:0;text-align:left;">
+          ${icon(resolveDomainIcon(item.ico, item.ico), 15)}
+          <span style="min-width:0;">
+            <span style="display:block;">${esc(item.label)}</span>
+            ${item.snippet ? `<span class="xs muted truncate" style="display:block;max-width:440px;">${esc(item.snippet)}</span>` : ""}
+          </span>
         </span>
-        <span class="xs muted">${esc(item.meta)}</span>
+        <span class="xs muted" style="flex-shrink:0;">${esc(item.meta)}</span>
       </button>`
       )
       .join("");
     listEl.querySelectorAll(".cmd-item").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const picked = filtered[Number(btn.dataset.idx)];
+        const picked = merged[Number(btn.dataset.idx)];
         closeCommandPalette();
         if (picked) location.hash = picked.hash;
       });
     });
-    return filtered;
+    return merged;
   };
 
   modal.innerHTML = `
     <div class="cmd-dialog" role="dialog" aria-modal="true" aria-label="Paleta de comandos">
       <div class="cmd-input-row">
         ${icon("search", 16)}
-        <input type="text" class="cmd-input" placeholder="Buscar una lección, un laboratorio o una acción…" aria-label="Buscar" autocomplete="off" />
+        <input type="text" class="cmd-input" placeholder="Buscar fórmulas, ejercicios, tarjetas, apuntes o acciones…" aria-label="Buscar" autocomplete="off" />
         <kbd class="kbd">ESC</kbd>
       </div>
       <div class="cmd-list"></div>
       <div class="cmd-footer">
         <span>↑ ↓ para moverte · Enter para abrir</span>
-        <span>Esc para cerrar</span>
+        <span>Busca en lecciones, ejercicios, tarjetas y cuaderno</span>
       </div>
     </div>
   `;
@@ -524,7 +584,25 @@ async function openCommandPalette() {
 
   input.addEventListener("input", () => {
     cmdSelected = 0;
-    currentFiltered = renderList(input.value);
+    const q = input.value.trim();
+    if (q.length < 2) {
+      remoteResults = [];
+      currentFiltered = renderList(q);
+      return;
+    }
+    currentFiltered = renderList(q);
+    clearTimeout(searchTimer);
+    const seq = ++searchSeq;
+    searchTimer = setTimeout(async () => {
+      try {
+        const res = await api.get(`/api/search?q=${encodeURIComponent(q)}&limit=18`);
+        if (seq !== searchSeq || !cmdOpen) return;
+        remoteResults = res.results || [];
+        currentFiltered = renderList(input.value);
+      } catch {
+        // non-fatal
+      }
+    }, 150);
   });
 
   input.addEventListener("keydown", (e) => {

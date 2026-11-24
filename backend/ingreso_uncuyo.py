@@ -83,6 +83,7 @@ SUBJECTS: list[dict[str, Any]] = [
                     "a2-division-polinomios",
                     "a2-casos-factoreo",
                     "al-factorizar-cuadraticas",
+                    "g-ecuacion-circulo",
                     "a2-expresiones-racionales",
                 ],
             },
@@ -104,6 +105,7 @@ SUBJECTS: list[dict[str, Any]] = [
                     "a2-logaritmos",
                     "a2-ecuaciones-exponenciales-logaritmicas",
                     "a2-graficas-exp-log",
+                    "a2-modelos-exponenciales",
                 ],
             },
             {
@@ -179,8 +181,44 @@ def program_slugs(subject_key: str | None = None) -> set[str]:
     }
 
 
+def _split_unit_title(title: str, fallback_idx: int) -> tuple[str, str]:
+    """Turn 'Unidad 1 · Números reales' into ('U1', 'Números reales')."""
+    if "·" in title:
+        prefix, rest = [part.strip() for part in title.split("·", 1)]
+        digits = "".join(ch for ch in prefix if ch.isdigit())
+        code = f"U{digits}" if digits else f"U{fallback_idx}"
+        return code, rest
+    return f"U{fallback_idx}", title
+
+
+def _pick_next_action(all_topics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Choose the single highest-value next action for a subject."""
+    due_topic = next((t for t in all_topics if t["due_count"] > 0), None)
+    if due_topic:
+        return {"kind": "review", "topic": due_topic}
+    to_practice = next((t for t in all_topics if t["lesson_completed"] and t["cards"] > 0 and t["practiced_pct"] < 60), None)
+    if to_practice:
+        return {"kind": "practice", "topic": to_practice}
+    next_lesson = next((t for t in all_topics if not t["lesson_completed"]), None)
+    if next_lesson:
+        return {"kind": "lesson", "topic": next_lesson}
+    next_exercises = next((t for t in all_topics if t["exercises_solved"] < t["exercises_total"]), None)
+    if next_exercises:
+        return {"kind": "exercises", "topic": next_exercises}
+    return {"kind": "exam", "topic": None}
+
+
 def overview(db: Database) -> dict[str, Any]:
     """The syllabus with the learner's progress on every topic it maps to."""
+    from backend import study_tools
+
+    settings = db.get_settings()
+    exam_dates = settings.get("exam_dates") or {}
+    with db.connect() as conn:
+        notes_map = {
+            r["node_id"]: {"content": r["content"] or "", "bookmarked": bool(r["bookmarked"])}
+            for r in conn.execute("SELECT node_id, content, bookmarked FROM study_notes").fetchall()
+        }
     subjects = []
     for subject in SUBJECTS:
         try:
@@ -191,7 +229,7 @@ def overview(db: Database) -> dict[str, Any]:
         nodes = {n["slug"]: n for n in roadmap["nodes"]}
         exercise_topics = {t["slug"]: t for t in exercises["topics"]}
         units = []
-        for unit in subject["units"]:
+        for u_idx, unit in enumerate(subject["units"], start=1):
             topics = []
             for slug in unit["topics"]:
                 node = nodes.get(slug)
@@ -199,29 +237,56 @@ def overview(db: Database) -> dict[str, Any]:
                     continue
                 ex_topic = exercise_topics.get(slug)
                 ex_items = ex_topic["exercises"] if ex_topic else []
-                topics.append(
-                    {
-                        "node_id": node["id"],
-                        "slug": slug,
-                        "title": node["title"],
-                        "status": node["status"],
-                        "lesson_completed": node["lesson_completed"],
-                        "practiced_pct": node["practiced_pct"],
-                        "mastery_pct": node["mastery_pct"],
-                        "due_count": node["due_count"],
-                        "cards": node["items"] if isinstance(node["items"], int) else len(node["items"]),
-                        "exercises_total": len(ex_items),
-                        "exercises_solved": sum(1 for e in ex_items if e["status"]["solved"]),
-                        "exercises_official": sum(1 for e in ex_items if e.get("source")),
-                    }
+                cards_count = node["items"] if isinstance(node["items"], int) else len(node["items"])
+                ex_total = len(ex_items)
+                ex_solved = sum(1 for e in ex_items if e["status"]["solved"])
+                ex_unaided = sum(1 for e in ex_items if e["status"]["solved_unaided"])
+                ex_official = sum(1 for e in ex_items if e.get("source"))
+                note_info = notes_map.get(node["id"], {})
+                topic = {
+                    "node_id": node["id"],
+                    "slug": slug,
+                    "title": node["title"],
+                    "summary": node.get("summary") or "",
+                    "est_minutes": int((node.get("metadata") or {}).get("est_minutes") or 0),
+                    "status": node["status"],
+                    "lesson_completed": node["lesson_completed"],
+                    "practiced_pct": node["practiced_pct"],
+                    "mastery_pct": node["mastery_pct"],
+                    "due_count": node["due_count"],
+                    "cards": cards_count,
+                    "exercises_total": ex_total,
+                    "exercises_solved": ex_solved,
+                    "exercises_unaided": ex_unaided,
+                    "exercises_official": ex_official,
+                    "struggling": bool(ex_topic["struggling"]) if ex_topic else False,
+                    "bookmarked": bool(note_info.get("bookmarked")),
+                    "has_note": bool((note_info.get("content") or "").strip()),
+                }
+                topic["progress_pct"] = round(_topic_progress(topic))
+                topic["completed"] = bool(
+                    topic["lesson_completed"]
+                    and (cards_count == 0 or topic["practiced_pct"] >= 60)
+                    and (ex_total == 0 or ex_solved == ex_total)
                 )
+                topics.append(topic)
             if topics:
                 done = sum(1 for t in topics if t["lesson_completed"])
+                code, short_title = _split_unit_title(unit["title"], u_idx)
                 units.append(
                     {
+                        "code": code,
                         "title": unit["title"],
+                        "short_title": short_title,
                         "topics": topics,
                         "lessons_done": done,
+                        "exercises_total": sum(t["exercises_total"] for t in topics),
+                        "exercises_solved": sum(t["exercises_solved"] for t in topics),
+                        "exercises_unaided": sum(t["exercises_unaided"] for t in topics),
+                        "exercises_official": sum(t["exercises_official"] for t in topics),
+                        "due_count": sum(t["due_count"] for t in topics),
+                        "mastered_count": sum(1 for t in topics if t["status"] == "mastered"),
+                        "est_minutes": sum(t["est_minutes"] for t in topics),
                         "progress_pct": round(sum(_topic_progress(t) for t in topics) / len(topics)),
                     }
                 )
@@ -230,6 +295,15 @@ def overview(db: Database) -> dict[str, Any]:
         next_topic = next((t for t in all_topics if not t["lesson_completed"]), None) or next(
             (t for t in all_topics if t["exercises_solved"] < t["exercises_total"]), None
         )
+        lessons_done = sum(1 for t in all_topics if t["lesson_completed"])
+        ex_total_sub = sum(t["exercises_total"] for t in all_topics)
+        ex_solved_sub = sum(t["exercises_solved"] for t in all_topics)
+        pace = study_tools.compute_exam_pace(
+            exam_dates.get(subject["key"]),
+            len(all_topics) - lessons_done,
+            ex_total_sub - ex_solved_sub,
+        )
+        exam_stats = study_tools.list_exams(db, domain_slug=roadmap["domain"]["slug"], limit=10)["stats"]
         subjects.append(
             {
                 "key": subject["key"],
@@ -239,16 +313,42 @@ def overview(db: Database) -> dict[str, Any]:
                 "exam": subject["exam"],
                 "units": units,
                 "topics_total": len(all_topics),
-                "lessons_done": sum(1 for t in all_topics if t["lesson_completed"]),
-                "exercises_total": sum(t["exercises_total"] for t in all_topics),
-                "exercises_solved": sum(t["exercises_solved"] for t in all_topics),
+                "lessons_done": lessons_done,
+                "exercises_total": ex_total_sub,
+                "exercises_solved": ex_solved_sub,
+                "exercises_unaided": sum(t["exercises_unaided"] for t in all_topics),
                 "exercises_official": sum(t["exercises_official"] for t in all_topics),
+                "due_count": sum(t["due_count"] for t in all_topics),
+                "mastered_count": sum(1 for t in all_topics if t["status"] == "mastered"),
+                "bookmarked_count": sum(1 for t in all_topics if t["bookmarked"]),
+                "units_done": sum(1 for u in units if u["lessons_done"] >= len(u["topics"])),
+                "est_minutes_remaining": sum(t["est_minutes"] for t in all_topics if not t["lesson_completed"]),
                 "progress_pct": round(sum(_topic_progress(t) for t in all_topics) / len(all_topics)) if all_topics else 0,
                 "outside_count": sum(1 for slug in nodes if slug not in listed),
                 "next_topic": next_topic,
+                "next_action": _pick_next_action(all_topics),
+                "pace": pace,
+                "exam_stats": exam_stats,
             }
         )
-    return {**COURSE, "subjects": subjects}
+    overall_pct = round(sum(s["progress_pct"] for s in subjects) / len(subjects)) if subjects else 0
+    return {
+        **COURSE,
+        "overall_pct": overall_pct,
+        "topics_total": sum(s["topics_total"] for s in subjects),
+        "lessons_done": sum(s["lessons_done"] for s in subjects),
+        "exercises_total": sum(s["exercises_total"] for s in subjects),
+        "exercises_solved": sum(s["exercises_solved"] for s in subjects),
+        "exercises_unaided": sum(s["exercises_unaided"] for s in subjects),
+        "exercises_official": sum(s["exercises_official"] for s in subjects),
+        "due_count": sum(s["due_count"] for s in subjects),
+        "mastered_count": sum(s["mastered_count"] for s in subjects),
+        "bookmarked_count": sum(s["bookmarked_count"] for s in subjects),
+        "subjects_ready": sum(1 for s in subjects if s["progress_pct"] >= COURSE["pass_mark"]),
+        "today": study_tools.get_today_activity(db),
+        "exam_dates": exam_dates,
+        "subjects": subjects,
+    }
 
 
 def _topic_progress(topic: dict[str, Any]) -> float:
